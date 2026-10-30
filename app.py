@@ -27,19 +27,32 @@ def fetch_json(url):
     with urlopen(req, timeout=30) as response:
         return json.loads(response.read().decode("utf-8"))
 
+
 def archive_search(term):
-    query = f"mediatype:movies AND ({term})"
+    phrase = " ".join(term.strip().split()).replace('"', "")
+
+    if not phrase:
+        return []
+
+    query = f'title:"{phrase}" AND mediatype:movies'
+
     url = (
         ARCHIVE + "/advancedsearch.php?q=" + quote(query)
         + "&fl[]=identifier&fl[]=title&fl[]=year"
-        + "&fl[]=description&rows=50&page=1&output=json"
+        + "&fl[]=description&rows=100&page=1&output=json"
     )
-    return fetch_json(url)["response"]["docs"]
 
-def get_item(identifier):
-    return fetch_json(
-        ARCHIVE + "/metadata/" + quote(identifier, safe="")
-    )
+    results = fetch_json(url)["response"]["docs"]
+
+    # Só apresentar títulos que contenham a pesquisa completa
+    filtered = []
+    for item in results:
+        title = str(item.get("title", ""))
+        if phrase.casefold() in title.casefold():
+            filtered.append(item)
+
+    return filtered
+
 
 def make_meta(item):
     identifier = item.get("identifier")
