@@ -1,1 +1,1 @@
-# Não são necessárias bibliotecas adicionais.
+yt-dlp
