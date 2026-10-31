@@ -2,290 +2,246 @@
 import json
 import os
 import re
-import logging
+import urllib.parse
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs, unquote, quote
-from urllib.request import Request, urlopen
 
-ARCHIVE = "https://archive.org"
-
-logging.basicConfig(level=logging.INFO)
+PORT = int(os.environ.get("PORT", 10000))
+ADDON_ID = "pt.liveconcerts.nuvio"
+BASE_URL = os.environ.get(
+    "BASE_URL",
+    "https://live-concerts-new.onrender.com"
+).rstrip("/")
 
 MANIFEST = {
-    "id": "pt.ruben.liveconcerts",
-    "version": "2.0.0",
-    "name": "Live Music Concerts",
-    "description": "Pesquisa concertos, DVDs musicais e gravações ao vivo.",
+    "id": ADDON_ID,
+    "version": "1.0.0",
+    "name": "Live Concerts",
+    "description": "Pesquisa de concertos completos e atuações ao vivo.",
     "resources": ["catalog", "meta", "stream"],
     "types": ["movie"],
+    "idPrefixes": ["archive:"],
     "catalogs": [
         {
             "type": "movie",
             "id": "liveconcerts",
-            "name": "Live Music Concerts",
+            "name": "Concertos ao Vivo",
             "extra": [
                 {"name": "search", "isRequired": False}
             ]
         }
-    ]
+    ],
+    "behaviorHints": {
+        "adult": False,
+        "configurable": False
+    }
 }
 
-VIDEO_EXTENSIONS = (
-    ".mp4", ".mkv", ".webm", ".mov", ".avi", ".mpeg", ".mpg"
-)
-
+HEADERS = {
+    "User-Agent": "LiveConcertsAddon/1.0"
+}
 
 def fetch_json(url):
-    request = Request(
-        url,
-        headers={
-            "User-Agent": "LiveMusicConcerts/2.0",
-            "Accept": "application/json"
-        }
-    )
-    with urlopen(request, timeout=35) as response:
+    request = urllib.request.Request(url, headers=HEADERS)
+    with urllib.request.urlopen(request, timeout=20) as response:
         return json.loads(response.read().decode("utf-8"))
 
+def search_archive(query):
+    params = {
+        "q": (
+            'mediatype:movies AND '
+            '(subject:concert OR subject:music OR subject:live)'
+        ),
+        "fl[]": ["identifier", "title", "year", "description"],
+        "rows": "100",
+        "page": "1",
+        "output": "json",
+        "sort[]": "downloads desc"
+    }
 
-def clean_text(value):
-    if isinstance(value, list):
-        return " ".join(str(x) for x in value[:5])
-    if value is None:
-        return ""
-    return str(value)
-
-
-def archive_search(term):
-    phrase = " ".join(term.strip().split())
-    phrase = phrase.replace('"', "").replace("\\", "")
-
-    if not phrase:
-        return []
-
-    # Pesquisa pela expressão completa no título
-    query = f'title:"{phrase}" AND mediatype:movies'
+    if query:
+        params["q"] += " AND " + query
 
     url = (
-        ARCHIVE + "/advancedsearch.php?q=" + quote(query)
-        + "&fl[]=identifier"
-        + "&fl[]=title"
-        + "&fl[]=year"
-        + "&fl[]=description"
-        + "&rows=100&page=1&output=json"
+        "https://archive.org/advancedsearch.php?"
+        + urllib.parse.urlencode(params, doseq=True)
     )
 
     data = fetch_json(url)
-    documents = data.get("response", {}).get("docs", [])
+    return data.get("response", {}).get("docs", [])
 
-    # Filtra novamente para evitar resultados irrelevantes
-    filtered = []
-    phrase_lower = phrase.casefold()
-
-    for item in documents:
-        title = clean_text(item.get("title", ""))
-        if phrase_lower in title.casefold():
-            filtered.append(item)
-
-    return filtered
-
-
-def get_item(identifier):
-    url = ARCHIVE + "/metadata/" + quote(identifier, safe="")
-    return fetch_json(url)
-
-
-def image_url(identifier):
-    return (
-        ARCHIVE + "/services/img/"
-        + quote(identifier, safe="")
-    )
-
-
-def make_meta(identifier, metadata):
-    title = clean_text(metadata.get("title")) or identifier
-    description = clean_text(metadata.get("description"))
-    year = clean_text(metadata.get("year"))
+def make_meta(item):
+    identifier = item.get("identifier")
+    title = item.get("title", identifier)
 
     return {
-        "id": identifier,
+        "id": "archive:" + identifier,
         "type": "movie",
         "name": title,
-        "description": description[:1500],
-        "poster": image_url(identifier),
-        "background": image_url(identifier),
-        "releaseInfo": year
+        "description": item.get("description", ""),
+        "year": item.get("year"),
+        "poster": "https://archive.org/services/img/" + identifier,
+        "background": "https://archive.org/services/img/" + identifier,
+        "genres": ["Live Music", "Concert"]
     }
 
-
-def get_streams(identifier):
-    data = get_item(identifier)
-    files = data.get("files", [])
-    streams = []
-
-    for file in files:
-        filename = clean_text(file.get("name"))
-        lower = filename.lower()
-
-        if not lower.endswith(VIDEO_EXTENSIONS):
-            continue
-
-        if file.get("private") in (True, "true", 1):
-            continue
-
-        if file.get("source") == "original":
-            pass
-
-        download_url = (
-            ARCHIVE + "/download/"
-            + quote(identifier, safe="")
-            + "/"
-            + quote(filename, safe="")
-        )
-
-        size = file.get("size")
-        size_text = ""
-
-        try:
-            if size:
-                size_text = (
-                    " | "
-                    + str(round(int(size) / 1048576))
-                    + " MB"
-                )
-        except (ValueError, TypeError):
-            pass
-
-        streams.append({
-            "name": "Internet Archive",
-            "title": filename + size_text,
-            "url": download_url
-        })
-
-    # Primeiro os formatos mais comuns
-    streams.sort(
-        key=lambda item: (
-            0 if item["title"].lower().split("|")[0].strip().endswith(".mp4")
-            else 1
-        )
+def get_files(identifier):
+    url = (
+        "https://archive.org/metadata/"
+        + urllib.parse.quote(identifier, safe="")
     )
 
-    return streams[:30]
+    data = fetch_json(url)
+    files = data.get("files", [])
 
+    allowed = (".mp4", ".mkv", ".webm", ".mov", ".avi", ".mpeg", ".mpg")
+
+    results = []
+
+    for file in files:
+        name = file.get("name", "")
+
+        if name.lower().endswith(allowed):
+            results.append(file)
+
+    return results
+
+def make_streams(identifier):
+    streams = []
+
+    for file in get_files(identifier):
+        filename = file.get("name")
+        size = file.get("size")
+
+        url = (
+            "https://archive.org/download/"
+            + urllib.parse.quote(identifier, safe="")
+            + "/"
+            + urllib.parse.quote(filename, safe="/")
+        )
+
+        description = "Internet Archive"
+
+        if size:
+            try:
+                description += " | " + str(round(int(size) / 1024**3, 2)) + " GB"
+            except (ValueError, TypeError):
+                pass
+
+        streams.append({
+            "name": "Live Concerts",
+            "title": filename + "\n" + description,
+            "url": url,
+            "behaviorHints": {
+                "notWebReady": False
+            }
+        })
+
+    return streams
 
 class Handler(BaseHTTPRequestHandler):
 
-    def send_json(self, data, status=200):
-        body = json.dumps(
-            data,
-            ensure_ascii=False
-        ).encode("utf-8")
+    def send_json(self, data):
+        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
 
-        self.send_response(status)
-        self.send_header(
-            "Content-Type",
-            "application/json; charset=utf-8"
-        )
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
-    def do_OPTIONS(self):
-        self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.end_headers()
-
     def do_GET(self):
-        parsed = urlparse(self.path)
-        path = unquote(parsed.path)
-        parts = path.strip("/").split("/")
-        params = parse_qs(parsed.query)
+        path = urllib.parse.urlparse(self.path).path
 
         if path == "/":
-            return self.send_json({
-                "addon": "Live Music Concerts",
+            self.send_json({
+                "name": "Live Concerts",
                 "status": "online",
-                "version": "2.0.0"
+                "manifest": BASE_URL + "/manifest.json"
             })
+            return
 
         if path == "/manifest.json":
-            return self.send_json(MANIFEST)
+            self.send_json(MANIFEST)
+            return
 
-        # CATÁLOGO E PESQUISA
+        parts = path.strip("/").split("/")
+
         if len(parts) >= 3 and parts[0] == "catalog":
-            term = params.get("search", [""])[0]
+            query = urllib.parse.parse_qs(
+                urllib.parse.urlparse(self.path).query
+            )
 
-            for part in parts[3:]:
-                if part.startswith("search="):
-                    term = part[len("search="):]
-                    term = re.sub(r"\.json$", "", term)
+            search = query.get("search", [""])[0]
 
-            if not term:
-                term = "live concert"
+            if not search:
+                match = re.search(r"search=(.*)", self.path)
+                if match:
+                    search = urllib.parse.unquote(match.group(1))
 
-            try:
-                documents = archive_search(term)
-                metas = []
+            if search:
+                docs = search_archive(
+                    'title:"' + search.replace('"', '') + '"'
+                )
+            else:
+                docs = search_archive("")
 
-                for item in documents:
-                    identifier = item.get("identifier")
-                    if not identifier:
-                        continue
+            metas = [make_meta(item) for item in docs]
 
-                    metas.append(
-                        make_meta(identifier, item)
-                    )
+            self.send_json({"metas": metas})
+            return
 
-                return self.send_json({"metas": metas})
-
-            except Exception as error:
-                logging.exception("Erro na pesquisa: %s", error)
-                return self.send_json({"metas": []})
-
-        # FICHA INDIVIDUAL DO CONCERTO
         if len(parts) >= 3 and parts[0] == "meta":
-            identifier = re.sub(r"\.json$", "", parts[2])
+            identifier = urllib.parse.unquote(parts[2])
+
+            if identifier.startswith("archive:"):
+                identifier = identifier.split(":", 1)[1]
 
             try:
-                data = get_item(identifier)
+                data = fetch_json(
+                    "https://archive.org/metadata/"
+                    + urllib.parse.quote(identifier, safe="")
+                )
+
                 metadata = data.get("metadata", {})
-                meta = make_meta(identifier, metadata)
 
-                return self.send_json({"meta": meta})
+                item = {
+                    "identifier": identifier,
+                    "title": metadata.get("title", identifier),
+                    "description": metadata.get("description", ""),
+                    "year": metadata.get("year")
+                }
 
-            except Exception as error:
-                logging.exception("Erro nos metadados: %s", error)
-                return self.send_json({"meta": None})
+                self.send_json({"meta": make_meta(item)})
 
-        # FONTES DE REPRODUÇÃO
+            except Exception:
+                self.send_json({"meta": None})
+
+            return
+
         if len(parts) >= 3 and parts[0] == "stream":
-            identifier = re.sub(r"\.json$", "", parts[2])
+            identifier = urllib.parse.unquote(parts[2])
+
+            if identifier.startswith("archive:"):
+                identifier = identifier.split(":", 1)[1]
 
             try:
-                streams = get_streams(identifier)
-                return self.send_json({"streams": streams})
+                streams = make_streams(identifier)
+                self.send_json({"streams": streams})
 
-            except Exception as error:
-                logging.exception("Erro nos streams: %s", error)
-                return self.send_json({"streams": []})
+            except Exception:
+                self.send_json({"streams": []})
 
-        return self.send_json({"error": "Not found"}, 404)
+            return
+
+        self.send_response(404)
+        self.end_headers()
 
     def log_message(self, format, *args):
-        logging.info("%s - %s", self.address_string(), format % args)
+        print(format % args)
 
-
-port = int(os.environ.get("PORT", 10000))
-
-server = ThreadingHTTPServer(
-    ("0.0.0.0", port),
-    Handler
-)
-
-logging.info("Live Music Concerts iniciado na porta %s", port)
-
-server.serve_forever()
+if __name__ == "__main__":
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    print("Live Concerts iniciado na porta", PORT)
+    server.serve_forever()
